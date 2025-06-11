@@ -24,7 +24,7 @@ class AITutor:
     def __init__(self, api_key: str):
         self.api_key = api_key
         genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-pro')
+        self.model = genai.GenerativeModel('gemini-2.0-flash')
         self.search = DuckDuckGoSearchRun()
         
     def search_topic_info(self, topic: str) -> str:
