@@ -1,16 +1,15 @@
 import streamlit as st
-import google.generativeai as genai
-# Updated imports to fix deprecation warnings
-from langchain_community.llms import GooglePalm
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
 from langchain_community.tools import DuckDuckGoSearchRun
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
-from langchain.agents import initialize_agent, Tool
-from langchain.agents import AgentType
+from langchain.llms.base import LLM
+from langchain.callbacks.manager import CallbackManagerForLLMRun
+from typing import Optional, List, Any, Dict
 import json
 import re
 from datetime import datetime
-from typing import Dict, List, Any
 import requests
 from bs4 import BeautifulSoup
 
@@ -21,11 +20,94 @@ st.set_page_config(
     layout="wide"
 )
 
+class GemmaLLM(LLM):
+    """Custom LangChain LLM wrapper for Gemma model"""
+    
+    tokenizer: Any = None
+    model: Any = None
+    model_name: str = "google/gemma-2b-it"
+    max_length: int = 1024
+    temperature: float = 0.7
+    
+    def __init__(self, model_name: str = "google/gemma-2b-it", **kwargs):
+        super().__init__(**kwargs)
+        self.model_name = model_name
+        self.load_model()
+    
+    def load_model(self):
+        """Load Gemma model and tokenizer"""
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_name,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                device_map="auto" if torch.cuda.is_available() else None,
+                low_cpu_mem_usage=True
+            )
+            
+            # Set pad token if not exists
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+                
+        except Exception as e:
+            st.error(f"Error loading model: {str(e)}")
+            raise e
+    
+    @property
+    def _llm_type(self) -> str:
+        return "gemma"
+    
+    def _call(
+        self,
+        prompt: str,
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> str:
+        """Generate text using Gemma model"""
+        try:
+            # Format prompt for instruction-tuned model
+            formatted_prompt = f"<bos><start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n"
+            
+            inputs = self.tokenizer(
+                formatted_prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+                padding=True
+            )
+            
+            # Move to same device as model
+            if torch.cuda.is_available():
+                inputs = {k: v.cuda() for k, v in inputs.items()}
+            
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=self.max_length,
+                    temperature=self.temperature,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    repetition_penalty=1.1
+                )
+            
+            # Decode only the new tokens
+            response = self.tokenizer.decode(
+                outputs[0][inputs['input_ids'].shape[1]:], 
+                skip_special_tokens=True
+            )
+            
+            return response.strip()
+            
+        except Exception as e:
+            st.error(f"Generation error: {str(e)}")
+            return "Sorry, I encountered an error generating the response."
+
 class AITutor:
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-2.0-flash')
+    def __init__(self, model_name: str = "google/gemma-2b-it"):
+        self.model_name = model_name
+        self.llm = GemmaLLM(model_name=model_name)
         self.search = DuckDuckGoSearchRun()
         
     def search_topic_info(self, topic: str) -> str:
@@ -33,7 +115,7 @@ class AITutor:
         try:
             query = f"{topic} tutorial examples latest 2024"
             results = self.search.run(query)
-            return results[:2000]  # Limit search results
+            return results[:1500]  # Limit search results
         except Exception as e:
             st.error(f"Search error: {str(e)}")
             return ""
@@ -44,41 +126,47 @@ class AITutor:
         # Fetch latest topic info
         search_results = self.search_topic_info(topic)
         
-        prompt = f"""
-As an expert AI Tutor, create {num_questions} quiz questions about "{topic}" at {difficulty} difficulty.
+        prompt = f"""Create {num_questions} quiz questions about "{topic}" at {difficulty} difficulty level.
 
-Latest information about the topic:
-{search_results}
+Context information:
+{search_results[:800]}
 
-Format each question in JSON with this structure:
-{{
+Generate questions in this exact JSON format:
+[
+  {{
     "question_id": 1,
-    "type": "multiple_choice" | "text_short" | "text_long" | "code",
-    "question": "Full question text",
-    "options": ["A", "B", "C", "D"] (multiple choice only),
-    "correct_answer": "the correct answer",
-    "explanation": "why this answer is correct",
+    "type": "multiple_choice",
+    "question": "What is the main concept of {topic}?",
+    "options": ["Option A", "Option B", "Option C", "Option D"],
+    "correct_answer": "Option A",
+    "explanation": "Explanation of why this is correct",
     "points": 10
-}}
+  }}
+]
 
-Distribute question types as follows:
-- 40% multiple choice
-- 30% short text response
-- 20% code snippets (programming topic)
-- 10% long essay
+Question types to include:
+- multiple_choice: 40%
+- text_short: 30% 
+- text_long: 20%
+- code: 10% (if programming topic)
 
-Ensure questions are practical and reflect the latest information.
-
-Return the response as a valid JSON array."""
+Make questions practical and test understanding. Return only valid JSON array."""
         
         try:
-            response = self.model.generate_content(prompt)
-            json_match = re.search(r'\[.*\]', response.text, re.DOTALL)
+            response = self.llm._call(prompt)
+            
+            # Extract JSON from response
+            json_match = re.search(r'\[.*\]', response, re.DOTALL)
             if json_match:
-                quiz_data = json.loads(json_match.group())
-                return {"questions": quiz_data, "topic": topic, "difficulty": difficulty}
-            else:
-                return self._create_fallback_quiz(topic, difficulty, num_questions)
+                try:
+                    quiz_data = json.loads(json_match.group())
+                    return {"questions": quiz_data, "topic": topic, "difficulty": difficulty}
+                except json.JSONDecodeError:
+                    pass
+            
+            # If JSON parsing fails, create fallback
+            return self._create_fallback_quiz(topic, difficulty, num_questions)
+            
         except Exception as e:
             st.error(f"Quiz generation error: {str(e)}")
             return self._create_fallback_quiz(topic, difficulty, num_questions)
@@ -86,48 +174,108 @@ Return the response as a valid JSON array."""
     def _create_fallback_quiz(self, topic: str, difficulty: str, num_questions: int) -> Dict:
         """Fallback quiz if generation fails"""
         fallback_questions = []
+        
+        question_templates = {
+            "multiple_choice": {
+                "question": f"What is a key concept in {topic}?",
+                "options": ["Fundamental principle", "Basic structure", "Core methodology", "Essential practice"],
+                "correct_answer": "Fundamental principle"
+            },
+            "text_short": {
+                "question": f"Briefly explain the importance of {topic}.",
+                "correct_answer": f"{topic} is important because it provides essential knowledge and skills."
+            },
+            "text_long": {
+                "question": f"Describe in detail how {topic} can be applied in real-world scenarios.",
+                "correct_answer": f"{topic} has many practical applications including problem-solving and implementation."
+            },
+            "code": {
+                "question": f"Write a simple code example demonstrating {topic}.",
+                "correct_answer": f"# Example code for {topic}\nprint('Hello {topic}')"
+            }
+        }
+        
+        types = ["multiple_choice", "text_short", "text_long", "code"]
+        
         for i in range(num_questions):
-            fallback_questions.append({
+            q_type = types[i % len(types)]
+            template = question_templates[q_type]
+            
+            question = {
                 "question_id": i + 1,
-                "type": "multiple_choice",
-                "question": f"What is the basic concept of {topic}? (Question {i+1})",
-                "options": ["Concept A", "Concept B", "Concept C", "Concept D"],
-                "correct_answer": "Concept A",
-                "explanation": f"Concept A is the foundation of {topic}.",
+                "type": q_type,
+                "question": template["question"],
+                "correct_answer": template["correct_answer"],
+                "explanation": f"This covers fundamental aspects of {topic}.",
                 "points": 10
-            })
+            }
+            
+            if q_type == "multiple_choice":
+                question["options"] = template["options"]
+            
+            fallback_questions.append(question)
+        
         return {"questions": fallback_questions, "topic": topic, "difficulty": difficulty}
     
     def evaluate_answer(self, question: Dict, user_answer: str) -> Dict:
-        """Evaluate a user's answer using AI"""
+        """Evaluate a user's answer using Gemma"""
         
-        prompt = f"""
-Evaluate the user's answer for the following question:
+        prompt = f"""Evaluate this quiz answer:
 
 Question: {question['question']}
-Type: {question['type']}
+Question Type: {question['type']}
 Correct Answer: {question['correct_answer']}
-User Answer: {user_answer}
+User's Answer: {user_answer}
 
-Return evaluation in JSON:
-{{
-    "is_correct": true/false,
-    "score": 0-{question['points']},
-    "feedback": "detailed feedback",
-    "similarity_score": 0-100 (for text answers)
-}}
+Provide evaluation in this format:
+- Is the answer correct? (Yes/No)
+- Score out of {question['points']}
+- Brief feedback explaining why
+- Similarity percentage for text answers
 
-Use exact match for multiple choice.
-Assess meaning and completeness for text responses.
-Evaluate logic and syntax for code."""
+Be fair and consider partial credit for text answers."""
         
         try:
-            response = self.model.generate_content(prompt)
-            json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group())
+            response = self.llm._call(prompt)
+            
+            # Parse response to extract evaluation
+            is_correct = False
+            score = 0
+            feedback = "Unable to evaluate"
+            similarity_score = 0
+            
+            response_lower = response.lower()
+            
+            # Simple evaluation logic
+            if question['type'] == 'multiple_choice':
+                is_correct = user_answer.lower().strip() == question['correct_answer'].lower().strip()
+                score = question['points'] if is_correct else 0
+                similarity_score = 100 if is_correct else 0
             else:
-                return self._basic_evaluation(question, user_answer)
+                # For text answers, check for keyword matches
+                user_words = set(user_answer.lower().split())
+                correct_words = set(question['correct_answer'].lower().split())
+                common_words = user_words.intersection(correct_words)
+                
+                if len(correct_words) > 0:
+                    similarity_score = len(common_words) / len(correct_words) * 100
+                    score = int(question['points'] * similarity_score / 100)
+                    is_correct = similarity_score > 60
+            
+            if "correct" in response_lower or "yes" in response_lower:
+                is_correct = True
+            elif "incorrect" in response_lower or "no" in response_lower:
+                is_correct = False
+            
+            feedback = response[:200] if response else "Basic evaluation completed"
+            
+            return {
+                "is_correct": is_correct,
+                "score": max(0, min(question['points'], score)),
+                "feedback": feedback,
+                "similarity_score": max(0, min(100, similarity_score))
+            }
+            
         except Exception as e:
             st.error(f"Evaluation error: {str(e)}")
             return self._basic_evaluation(question, user_answer)
@@ -145,12 +293,15 @@ Evaluate logic and syntax for code."""
             }
         else:
             words_match = len(set(user_answer.lower().split()) & set(question['correct_answer'].lower().split()))
-            score = min(question['points'], words_match * 2)
+            total_words = len(set(question['correct_answer'].lower().split()))
+            similarity = (words_match / total_words * 100) if total_words > 0 else 0
+            score = int(question['points'] * similarity / 100)
+            
             return {
-                "is_correct": score > question['points'] * 0.6,
+                "is_correct": similarity > 60,
                 "score": score,
-                "feedback": "Your answer is close to correct." if score > 0 else "Answer is not accurate yet.",
-                "similarity_score": min(100, words_match * 10)
+                "feedback": f"Similarity: {similarity:.1f}%. " + ("Good match!" if similarity > 60 else "Could be improved."),
+                "similarity_score": similarity
             }
 
 
@@ -170,7 +321,7 @@ def init_session_state():
 
 def main():
     st.title("🎓 AI Tutor - Quiz Generator")
-    st.markdown("*Powered by LangChain & Gemini AI*")
+    st.markdown("*Powered by LangChain & Gemma AI*")
     
     init_session_state()
     
@@ -178,26 +329,43 @@ def main():
     with st.sidebar:
         st.header("⚙️ Settings")
         
-        api_key = st.text_input("Gemini API Key", type="password")
-        if not api_key:
-            st.warning("Enter your Gemini API Key to proceed.")
-            st.info("Get an API Key at: https://makersuite.google.com/app/apikey")
-            st.stop()
+        # Model selection
+        model_options = [
+            "google/gemma-2b-it",
+            "google/gemma-7b-it",
+            "google/gemma-2-2b-it",
+            "google/gemma-2-9b-it"
+        ]
         
-        if 'tutor' not in st.session_state or st.session_state.get('api_key') != api_key:
-            try:
-                st.session_state.tutor = AITutor(api_key)
-                st.session_state.api_key = api_key
-                st.success("✅ AI Tutor initialized successfully!")
-            except Exception as e:
-                st.error(f"Initialization error: {str(e)}")
-                st.stop()
+        selected_model = st.selectbox(
+            "Select Gemma Model",
+            model_options,
+            index=0,
+            help="Choose the Gemma model variant. Larger models may be more accurate but slower."
+        )
+        
+        if 'tutor' not in st.session_state or st.session_state.get('model_name') != selected_model:
+            with st.spinner(f"Loading {selected_model}..."):
+                try:
+                    st.session_state.tutor = AITutor(model_name=selected_model)
+                    st.session_state.model_name = selected_model
+                    st.success("✅ AI Tutor initialized successfully!")
+                except Exception as e:
+                    st.error(f"Initialization error: {str(e)}")
+                    st.error("Make sure you have enough memory and the model is available.")
+                    st.stop()
         
         st.subheader("📝 Quiz Setup")
         topic = st.text_input("Learning Topic", value="Python Introduction")
         difficulty = st.selectbox("Difficulty", ["Beginner", "Intermediate", "Advanced"])
         num_questions = st.slider("Number of Questions", 3, 10, 5)
         generate_button = st.button("🎯 Generate Quiz")
+        
+        # System info
+        st.subheader("💻 System Info")
+        st.info(f"CUDA Available: {'Yes' if torch.cuda.is_available() else 'No'}")
+        if torch.cuda.is_available():
+            st.info(f"GPU: {torch.cuda.get_device_name()}")
     
     # Generate quiz
     if generate_button and topic:
@@ -216,14 +384,15 @@ def main():
         st.markdown("## 👋 Welcome to AI Tutor!")
         st.markdown("""
 ### 🎯 Key Features:
+- **Gemma AI**: Powered by Google's Gemma language model
 - **Adaptive Quizzes**: Questions tailored by difficulty
 - **Multiple Question Types**: MCQ, essay, coding, short answer
-- **AI Evaluation**: Intelligent feedback by Gemini AI
+- **AI Evaluation**: Intelligent feedback by Gemma AI
 - **Real-time Search**: Latest topic info from the web
 - **Progress Tracking**: Monitor your learning journey
 
 ### 🚀 How to Use:
-1. Enter your **Gemini API Key** in the sidebar
+1. Select your preferred **Gemma model** in the sidebar
 2. Choose a **learning topic**
 3. Set **difficulty** and **number of questions**
 4. Click **Generate Quiz**
@@ -265,8 +434,9 @@ def main():
         user_answer = None
         prev = st.session_state.user_answers.get(idx, "")
         if question['type'] == 'multiple_choice':
-            default = question['options'].index(prev) if prev in question['options'] else 0
-            user_answer = st.radio("Select an option:", question['options'], index=default, key=f"q_{idx}")
+            options = question.get('options', ['A', 'B', 'C', 'D'])
+            default = options.index(prev) if prev in options else 0
+            user_answer = st.radio("Select an option:", options, index=default, key=f"q_{idx}")
         elif question['type'] == 'text_short':
             user_answer = st.text_input("Short answer:", value=prev, key=f"q_{idx}")
         elif question['type'] == 'text_long':
@@ -332,8 +502,8 @@ def main():
 
         if pct>=90: st.success("🎉 Excellent work! You have a strong grasp of the material.")
         elif pct>=80: st.success("👏 Good job! You understand the content well.")
-        elif pct>=70: st.warning("👍 Not bad! There’s room for improvement.")
-        else: st.error("💪 Keep practicing! Don’t give up.")
+        elif pct>=70: st.warning("👍 Not bad! There's room for improvement.")
+        else: st.error("💪 Keep practicing! Don't give up.")
 
         st.subheader("📋 Review Responses")
         for i, q in enumerate(st.session_state.quiz_data['questions']):
@@ -366,6 +536,7 @@ def main():
                 output = [f"AI TUTOR - QUIZ RESULTS", "="*20,
                          f"Topic: {st.session_state.quiz_data['topic']}",
                          f"Difficulty: {st.session_state.quiz_data['difficulty']}",
+                         f"Model: {st.session_state.get('model_name', 'gemma-2b-it')}",
                          f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                          "", f"Summary:",
                          f"- Total Score: {total_score}/{max_score}",
@@ -395,7 +566,7 @@ def main():
         """
 <table style='width:100%; text-align:center; color:#666;'>
   <tr><td><strong>🎓 AI Tutor Quiz Generator</strong></td></tr>
-  <tr><td>Powered by Google Gemini AI & LangChain | Made with ❤️ using Streamlit</td></tr>
+  <tr><td>Powered by Gemma AI & LangChain | Made with ❤️ using Streamlit</td></tr>
   <tr><td><em>Adaptive learning with cutting-edge AI technology</em></td></tr>
 </table>
 """, unsafe_allow_html=True)
